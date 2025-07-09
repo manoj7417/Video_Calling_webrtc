@@ -1,0 +1,20 @@
+name: webrtc-signaling-server
+services:
+- name: webrtc-signaling
+  source_dir: /
+  github:
+    repo: your-username/your-repo
+    branch: main
+  run_command: npm start
+  environment_slug: node-js
+  instance_count: 1
+  instance_size_slug: basic-xxs
+  envs:
+  - key: NODE_ENV
+    value: production
+  - key: PORT
+    value: "8080"
+  - key: HOST
+    value: "0.0.0.0"
+  - key: CORS_ORIGINS
+    value: "https://yourdomain.com,https://www.yourdomain.com,http://localhost:3000,http://localhost:5173" 
