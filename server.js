@@ -24,7 +24,7 @@ app.use(compression());
 // Production CORS configuration
 const corsOrigins = process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
-    : ["http://localhost:3000", "http://localhost:5173", "https://yourdomain.com"];
+    : ["http://localhost:3000", "http://localhost:5173", "https://upcresources.com"];
 
 console.log('CORS Origins:', corsOrigins);
 
