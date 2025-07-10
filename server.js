@@ -12,10 +12,23 @@ dotenv.config();
 const app = express();
 const server = createServer(app);
 
-// Security middleware
+// Security middleware with WebRTC-friendly settings
 app.use(helmet({
-    contentSecurityPolicy: false, // Disable CSP for WebRTC
-    crossOriginEmbedderPolicy: false // Disable for WebRTC
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "blob:"],
+            mediaSrc: ["'self'", "blob:"],
+            connectSrc: ["'self'", "wss:", "ws:", "https:", "http:"],
+            frameSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            upgradeInsecureRequests: []
+        }
+    },
+    crossOriginEmbedderPolicy: false, // Disable for WebRTC
+    crossOriginResourcePolicy: { policy: "cross-origin" } // Allow cross-origin for WebRTC
 }));
 
 // Compression middleware
@@ -28,27 +41,39 @@ const corsOrigins = process.env.CORS_ORIGINS
 
 console.log('CORS Origins:', corsOrigins);
 
-// Configure CORS for Socket.io
+// Configure CORS for Socket.io with enhanced cross-browser support
 const io = new Server(server, {
     cors: {
         origin: corsOrigins,
-        methods: ["GET", "POST"],
-        credentials: true
+        methods: ["GET", "POST", "OPTIONS"],
+        credentials: true,
+        allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
     },
     transports: ['websocket', 'polling'],
-    allowEIO3: true
+    allowEIO3: true,
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    upgradeTimeout: 10000,
+    maxHttpBufferSize: 1e8 // 100MB for large SDP messages
 });
 
 app.use(cors({
     origin: corsOrigins,
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Serve static files
+app.use(express.static('public'));
 
 // Store active calls and user connections
 const activeUsers = new Map(); // userId -> socketId
 const activeCalls = new Map(); // callId -> { caller: userId, callee: userId, status: 'pending'|'active'|'ended' }
 const socketUsers = new Map(); // socketId -> userId
+const browserInfo = new Map(); // socketId -> { browser, version, userAgent }
 
 // Add offer buffer for handling race conditions
 const offerBuffer = new Map(); // callId -> { offer, fromSocketId, toSocketId, timestamp }
@@ -69,6 +94,51 @@ setInterval(() => {
         console.log(`🧹 Cleaned up expired offer for call: ${callId}`);
     });
 }, 60000); // Check every minute
+
+// Browser detection utility
+function detectBrowser(userAgent) {
+    const ua = userAgent.toLowerCase();
+
+    if (ua.includes('chrome') && !ua.includes('edg')) {
+        return { browser: 'chrome', version: extractVersion(ua, 'chrome') };
+    } else if (ua.includes('firefox')) {
+        return { browser: 'firefox', version: extractVersion(ua, 'firefox') };
+    } else if (ua.includes('safari') && !ua.includes('chrome')) {
+        return { browser: 'safari', version: extractVersion(ua, 'safari') };
+    } else if (ua.includes('edge') || ua.includes('edg')) {
+        return { browser: 'edge', version: extractVersion(ua, 'edge') };
+    } else {
+        return { browser: 'unknown', version: 'unknown' };
+    }
+}
+
+function extractVersion(ua, browser) {
+    const regex = new RegExp(`${browser}[/\\s]([\\d.]+)`);
+    const match = ua.match(regex);
+    return match ? match[1] : 'unknown';
+}
+
+// WebRTC compatibility checker
+function getWebRTCCompatibility(browser, version) {
+    const compatibility = {
+        chrome: { minVersion: '56', features: ['unified-plan', 'rtp-sender', 'rtp-receiver'] },
+        firefox: { minVersion: '52', features: ['unified-plan', 'rtp-sender', 'rtp-receiver'] },
+        safari: { minVersion: '11', features: ['unified-plan'] },
+        edge: { minVersion: '79', features: ['unified-plan', 'rtp-sender', 'rtp-receiver'] }
+    };
+
+    const browserCompat = compatibility[browser];
+    if (!browserCompat) return { compatible: false, reason: 'Unsupported browser' };
+
+    const versionNum = parseFloat(version);
+    const minVersionNum = parseFloat(browserCompat.minVersion);
+
+    return {
+        compatible: versionNum >= minVersionNum,
+        features: browserCompat.features,
+        reason: versionNum < minVersionNum ? `Version ${version} is below minimum ${browserCompat.minVersion}` : null
+    };
+}
 
 // Basic health check endpoint
 app.get('/health', (req, res) => {
@@ -105,8 +175,31 @@ app.get('/api/webrtc/status', (req, res) => {
     });
 });
 
+// Browser compatibility endpoint
+app.get('/api/browser/compatibility', (req, res) => {
+    const userAgent = req.headers['user-agent'];
+    const browserInfo = detectBrowser(userAgent);
+    const compatibility = getWebRTCCompatibility(browserInfo.browser, browserInfo.version);
+
+    res.json({
+        browser: browserInfo.browser,
+        version: browserInfo.version,
+        userAgent: userAgent,
+        webrtcCompatible: compatibility.compatible,
+        features: compatibility.features,
+        reason: compatibility.reason
+    });
+});
+
 io.on('connection', (socket) => {
     console.log(`🔌 Socket connected: ${socket.id}`);
+
+    // Detect browser on connection
+    const userAgent = socket.handshake.headers['user-agent'];
+    const browser = detectBrowser(userAgent);
+    browserInfo.set(socket.id, browser);
+
+    console.log(`🌐 Browser detected: ${browser.browser} ${browser.version}`);
 
     // User authentication and registration
     socket.on('register', (userData) => {
@@ -118,6 +211,7 @@ io.on('connection', (socket) => {
                 console.log(`🔄 User ${userId} reconnecting from ${socketId} to ${socket.id}`);
                 socketUsers.delete(socketId);
                 activeUsers.delete(userId);
+                browserInfo.delete(socketId);
                 break;
             }
         }
@@ -126,10 +220,21 @@ io.on('connection', (socket) => {
         activeUsers.set(userId, socket.id);
         socketUsers.set(socket.id, userId);
 
-        console.log(`✅ User registered: ${userName} (${userId}) on socket ${socket.id}`);
+        console.log(`✅ User registered: ${userName} (${userId}) on socket ${socket.id} using ${browser.browser} ${browser.version}`);
 
-        // Notify user of successful registration
-        socket.emit('registered', { userId, socketId: socket.id });
+        // Check WebRTC compatibility
+        const compatibility = getWebRTCCompatibility(browser.browser, browser.version);
+
+        // Notify user of successful registration with browser info
+        socket.emit('registered', {
+            userId,
+            socketId: socket.id,
+            browser: browser.browser,
+            version: browser.version,
+            webrtcCompatible: compatibility.compatible,
+            features: compatibility.features,
+            reason: compatibility.reason
+        });
 
         // Send list of online users (optional)
         const onlineUsers = Array.from(activeUsers.keys());
@@ -155,25 +260,38 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Store call information
+        // Get browser compatibility for both users
+        const callerBrowser = browserInfo.get(socket.id);
+        const calleeBrowser = browserInfo.get(calleeSocketId);
+
+        const callerCompat = getWebRTCCompatibility(callerBrowser.browser, callerBrowser.version);
+        const calleeCompat = getWebRTCCompatibility(calleeBrowser.browser, calleeBrowser.version);
+
+        // Store call information with browser compatibility
         activeCalls.set(callId, {
             caller: callerId,
             callee: calleeId,
             status: 'pending',
             callerSocketId: socket.id,
             calleeSocketId: calleeSocketId,
+            callerBrowser: callerBrowser,
+            calleeBrowser: calleeBrowser,
+            callerCompatible: callerCompat.compatible,
+            calleeCompatible: calleeCompat.compatible,
             createdAt: Date.now()
         });
 
-        // Send call invitation to callee
+        // Send call invitation to callee with browser compatibility info
         io.to(calleeSocketId).emit('incomingCall', {
             callId,
             callerId,
             callerName,
-            callerSocketId: socket.id
+            callerSocketId: socket.id,
+            callerBrowser: callerBrowser,
+            callerCompatible: callerCompat.compatible
         });
 
-        console.log(`📡 Call invitation sent to ${calleeId}`);
+        console.log(`📡 Call invitation sent to ${calleeId} (${calleeBrowser.browser} ${calleeBrowser.version})`);
     });
 
     // Accept a call
@@ -207,9 +325,17 @@ io.on('connection', (socket) => {
             offerBuffer.delete(callId);
         }
 
-        // Notify both parties that call is accepted
-        io.to(call.callerSocketId).emit('callAccepted', { callId });
-        io.to(call.calleeSocketId).emit('callAccepted', { callId });
+        // Notify both parties that call is accepted with browser compatibility info
+        io.to(call.callerSocketId).emit('callAccepted', {
+            callId,
+            calleeBrowser: call.calleeBrowser,
+            calleeCompatible: call.calleeCompatible
+        });
+        io.to(call.calleeSocketId).emit('callAccepted', {
+            callId,
+            callerBrowser: call.callerBrowser,
+            callerCompatible: call.callerCompatible
+        });
     });
 
     // Reject a call
@@ -373,6 +499,7 @@ io.on('connection', (socket) => {
             // Remove user from active users
             activeUsers.delete(userId);
             socketUsers.delete(socket.id);
+            browserInfo.delete(socket.id);
 
             // End any active calls for this user
             for (const [callId, call] of activeCalls.entries()) {
@@ -435,4 +562,5 @@ server.listen(PORT, HOST, () => {
     console.log(`🚀 WebRTC Signaling Server running on ${HOST}:${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔗 CORS Origins: ${corsOrigins.join(', ')}`);
+    console.log(`🌐 Cross-browser WebRTC compatibility enabled`);
 }); 
