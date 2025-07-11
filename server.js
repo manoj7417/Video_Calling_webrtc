@@ -53,8 +53,29 @@ const io = new Server(server, {
     allowEIO3: true,
     pingTimeout: 60000,
     pingInterval: 25000,
-    upgradeTimeout: 10000,
-    maxHttpBufferSize: 1e8 // 100MB for large SDP messages
+    upgradeTimeout: 30000, // Increased for slower connections
+    maxHttpBufferSize: 1e8, // 100MB for large SDP messages
+    // Add better cross-browser compatibility
+    allowRequest: (req, fn) => {
+        // Allow all origins for better cross-browser compatibility
+        fn(null, true);
+    },
+    serveClient: false,
+    cookie: false,
+    // Add connection state options for better reliability
+    connectTimeout: 45000,
+    rememberUpgrade: true,
+    // Add error handling for different browsers
+    handlePreflightRequest: (req, res) => {
+        const headers = {
+            "Access-Control-Allow-Origin": req.headers.origin,
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With",
+            "Access-Control-Allow-Credentials": true
+        };
+        res.writeHead(200, headers);
+        res.end();
+    }
 });
 
 app.use(cors({
@@ -201,9 +222,27 @@ io.on('connection', (socket) => {
 
     console.log(`🌐 Browser detected: ${browser.browser} ${browser.version}`);
 
-    // User authentication and registration
+    // User authentication and registration with improved error handling
     socket.on('register', (userData) => {
         const { userId, userName } = userData;
+
+        // Validate input data
+        if (!userId || !userName) {
+            socket.emit('registrationError', {
+                error: 'Invalid user data',
+                code: 'INVALID_DATA'
+            });
+            return;
+        }
+
+        // Check socket connection state
+        if (!socket.connected) {
+            socket.emit('registrationError', {
+                error: 'Socket not connected',
+                code: 'SOCKET_NOT_CONNECTED'
+            });
+            return;
+        }
 
         // Remove user from any previous socket connection
         for (const [socketId, oldUserId] of socketUsers.entries()) {
@@ -212,6 +251,15 @@ io.on('connection', (socket) => {
                 socketUsers.delete(socketId);
                 activeUsers.delete(userId);
                 browserInfo.delete(socketId);
+
+                // Notify the old socket about disconnection
+                const oldSocket = io.sockets.sockets.get(socketId);
+                if (oldSocket && oldSocket.connected) {
+                    oldSocket.emit('userReconnected', {
+                        userId,
+                        newSocketId: socket.id
+                    });
+                }
                 break;
             }
         }
@@ -233,25 +281,112 @@ io.on('connection', (socket) => {
             version: browser.version,
             webrtcCompatible: compatibility.compatible,
             features: compatibility.features,
-            reason: compatibility.reason
+            reason: compatibility.reason,
+            timestamp: Date.now()
         });
 
-        // Send list of online users (optional)
-        const onlineUsers = Array.from(activeUsers.keys());
+        // Send list of online users with connection verification
+        const onlineUsers = [];
+        for (const [uid, sid] of activeUsers.entries()) {
+            const userSocket = io.sockets.sockets.get(sid);
+            if (userSocket && userSocket.connected) {
+                onlineUsers.push({
+                    userId: uid,
+                    socketId: sid,
+                    browser: browserInfo.get(sid) || { browser: 'unknown', version: 'unknown' }
+                });
+            } else {
+                // Clean up disconnected users
+                activeUsers.delete(uid);
+                socketUsers.delete(sid);
+                browserInfo.delete(sid);
+            }
+        }
+
         socket.emit('onlineUsers', onlineUsers);
 
-        // Broadcast user status change
-        socket.broadcast.emit('userStatusChange', { userId, isOnline: true });
+        // Broadcast user status change with delay to ensure registration completes
+        setTimeout(() => {
+            socket.broadcast.emit('userStatusChange', {
+                userId,
+                isOnline: true,
+                browser: browser.browser,
+                timestamp: Date.now()
+            });
+        }, 100);
     });
 
-    // Initiate a video call
+    // Initiate a video call with improved validation
     socket.on('initiateCall', (data) => {
         const { callId, callerId, calleeId, callerName } = data;
-        const calleeSocketId = activeUsers.get(calleeId);
+
+        // Validate input data
+        if (!callId || !callerId || !calleeId || !callerName) {
+            socket.emit('callError', {
+                error: 'Invalid call data',
+                callId,
+                code: 'INVALID_CALL_DATA'
+            });
+            return;
+        }
+
+        // Check if caller is registered
+        const callerSocketId = socketUsers.get(socket.id);
+        if (!callerSocketId || callerSocketId !== callerId) {
+            socket.emit('callError', {
+                error: 'Caller not properly registered',
+                callId,
+                code: 'CALLER_NOT_REGISTERED'
+            });
+            return;
+        }
+
+        let calleeSocketId = activeUsers.get(calleeId);
 
         console.log(`📞 Call initiated: ${callerId} calling ${calleeId} (Call ID: ${callId})`);
+        console.log(`🔍 Checking online users: ${Array.from(activeUsers.keys()).join(', ')}`);
 
         if (!calleeSocketId) {
+            // Double-check by cleaning up disconnected users and retrying
+            console.log(`⚠️ Initial lookup failed for ${calleeId}, cleaning up and retrying...`);
+
+            // Clean up disconnected users
+            for (const [uid, sid] of activeUsers.entries()) {
+                const userSocket = io.sockets.sockets.get(sid);
+                if (!userSocket || !userSocket.connected) {
+                    console.log(`🧹 Removing disconnected user: ${uid} (${sid})`);
+                    activeUsers.delete(uid);
+                    socketUsers.delete(sid);
+                    browserInfo.delete(sid);
+                }
+            }
+
+            // Retry lookup after cleanup
+            const retryCalleeSocketId = activeUsers.get(calleeId);
+            if (!retryCalleeSocketId) {
+                console.log(`❌ User ${calleeId} not found after cleanup. Online users: ${Array.from(activeUsers.keys()).join(', ')}`);
+                socket.emit('callError', {
+                    error: 'User is not online',
+                    callId,
+                    code: 'USER_OFFLINE',
+                    onlineUsers: Array.from(activeUsers.keys())
+                });
+                return;
+            }
+
+            // Update calleeSocketId for the rest of the function
+            calleeSocketId = retryCalleeSocketId;
+            console.log(`✅ Found ${calleeId} after cleanup: ${calleeSocketId}`);
+        }
+
+        // Verify callee socket is still connected
+        const calleeSocket = io.sockets.sockets.get(calleeSocketId);
+        if (!calleeSocket || !calleeSocket.connected) {
+            console.log(`❌ Callee socket ${calleeSocketId} is not connected`);
+            activeUsers.delete(calleeId);
+            socketUsers.delete(calleeSocketId);
+            browserInfo.delete(calleeSocketId);
+
             socket.emit('callError', {
                 error: 'User is not online',
                 callId,

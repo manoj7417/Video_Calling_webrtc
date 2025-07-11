@@ -374,11 +374,33 @@
                 webrtcClient.onRemoteStream = handleRemoteStream;
                 webrtcClient.onConnectionStateChange = handleConnectionStateChange;
                 webrtcClient.onIceConnectionStateChange = handleIceConnectionStateChange;
+                
+                // New event handlers for better cross-browser support
+                webrtcClient.onRegistered = handleRegistered;
+                webrtcClient.onRegistrationFailed = handleRegistrationFailed;
+                webrtcClient.onConnectionError = handleConnectionError;
+                webrtcClient.onDisconnected = handleDisconnected;
+                webrtcClient.onOnlineUsers = handleOnlineUsers;
+                webrtcClient.onUserStatusChange = handleUserStatusChange;
 
                 // Connect to signaling server
                 await webrtcClient.connect(userId, userName);
                 
-                updateStatus('Connected to signaling server', 'connected');
+                // Wait for registration to complete
+                let retries = 0;
+                const maxRetries = 10;
+                
+                while (!webrtcClient.isRegistered && retries < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    retries++;
+                    updateStatus(`Registering... (${retries}/${maxRetries})`, 'info');
+                }
+                
+                if (!webrtcClient.isRegistered) {
+                    throw new Error('Registration failed after maximum retries');
+                }
+                
+                updateStatus('Connected and registered successfully', 'connected');
                 
                 // Show call section
                 document.getElementById('callSection').style.display = 'block';
@@ -530,6 +552,53 @@
             updateStatus(`ICE connection state: ${state}`, state === 'connected' ? 'connected' : 'info');
         }
 
+        // New event handlers for better cross-browser support
+        function handleRegistered(data) {
+            console.log('Registration successful:', data);
+            updateStatus(`Registered successfully (${data.browser} ${data.version})`, 'connected');
+        }
+
+        function handleRegistrationFailed(error) {
+            console.error('Registration failed:', error);
+            updateStatus(`Registration failed: ${error.error}`, 'error');
+        }
+
+        function handleConnectionError(error) {
+            console.error('Connection error:', error);
+            updateStatus(`Connection error: ${error.message}`, 'error');
+        }
+
+        function handleDisconnected(reason) {
+            console.log('Disconnected:', reason);
+            updateStatus(`Disconnected: ${reason}`, 'error');
+        }
+
+        function handleOnlineUsers(users) {
+            console.log('Online users:', users);
+            // You can update UI to show online users here
+        }
+
+        function handleUserStatusChange(data) {
+            console.log('User status change:', data);
+            // You can update UI to show user status changes here
+        }
+
+        // Add a function to check connection status
+        function checkConnectionStatus() {
+            if (webrtcClient) {
+                const status = webrtcClient.getConnectionStatus();
+                console.log('Connection status:', status);
+                
+                if (!status.isConnected) {
+                    updateStatus('Not connected', 'error');
+                } else if (!status.isRegistered) {
+                    updateStatus('Connected but not registered', 'error');
+                } else {
+                    updateStatus('Connected and registered', 'connected');
+                }
+            }
+        }
+
         // Initialize page
         document.addEventListener('DOMContentLoaded', function() {
             updateBrowserInfo();
@@ -538,6 +607,9 @@
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 updateStatus('WebRTC not supported in this browser', 'error');
             }
+
+            // Check connection status every 10 seconds
+            setInterval(checkConnectionStatus, 10000);
         });
     </script>
 </body>

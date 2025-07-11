@@ -104,31 +104,74 @@ class WebRTCClient {
             this.userId = userId;
             this.userName = userName;
 
-            // Connect to signaling server with cross-browser compatible options
+            // Connect to signaling server with enhanced cross-browser compatible options
             this.socket = io(this.signalingServerUrl, {
                 transports: ['websocket', 'polling'],
-                timeout: 20000,
+                timeout: 30000, // Increased timeout for slower connections
                 forceNew: true,
                 reconnection: true,
-                reconnectionAttempts: 5,
-                reconnectionDelay: 1000
+                reconnectionAttempts: 10, // More attempts
+                reconnectionDelay: 1000,
+                reconnectionDelayMax: 5000,
+                maxReconnectionAttempts: 10,
+                // Browser-specific options
+                upgrade: true,
+                rememberUpgrade: true,
+                // Add additional headers for better compatibility
+                extraHeaders: {
+                    'User-Agent': navigator.userAgent
+                }
             });
+
+            // Set up connection state tracking
+            this.isConnected = false;
+            this.isRegistered = false;
+            this.registrationRetries = 0;
+            this.maxRegistrationRetries = 3;
 
             this.socket.on('connect', () => {
                 console.log('Connected to signaling server');
-                this.registerUser();
+                this.isConnected = true;
+                // Add delay before registration to ensure connection is stable
+                setTimeout(() => {
+                    this.registerUser();
+                }, 500);
             });
 
             this.socket.on('disconnect', (reason) => {
                 console.log('Disconnected from signaling server:', reason);
+                this.isConnected = false;
+                this.isRegistered = false;
+
+                if (this.onDisconnected) {
+                    this.onDisconnected(reason);
+                }
             });
 
             this.socket.on('connect_error', (error) => {
                 console.error('Connection error:', error);
+                this.isConnected = false;
+
+                if (this.onConnectionError) {
+                    this.onConnectionError(error);
+                }
+            });
+
+            this.socket.on('reconnect', (attemptNumber) => {
+                console.log(`Reconnected after ${attemptNumber} attempts`);
+                this.isConnected = true;
+                // Re-register after reconnection
+                setTimeout(() => {
+                    this.registerUser();
+                }, 1000);
             });
 
             // Handle signaling events
             this.socket.on('registered', this.handleRegistered.bind(this));
+            this.socket.on('registrationError', this.handleRegistrationError.bind(this));
+            this.socket.on('userReconnected', this.handleUserReconnected.bind(this));
+            this.socket.on('onlineUsers', this.handleOnlineUsers.bind(this));
+            this.socket.on('userStatusChange', this.handleUserStatusChange.bind(this));
             this.socket.on('incomingCall', this.handleIncomingCall.bind(this));
             this.socket.on('callAccepted', this.handleCallAccepted.bind(this));
             this.socket.on('callRejected', this.handleCallRejected.bind(this));
@@ -146,6 +189,13 @@ class WebRTCClient {
     }
 
     registerUser() {
+        if (!this.isConnected) {
+            console.log('Socket not connected, waiting...');
+            setTimeout(() => this.registerUser(), 1000);
+            return;
+        }
+
+        console.log(`Registering user: ${this.userName} (${this.userId})`);
         this.socket.emit('register', {
             userId: this.userId,
             userName: this.userName
@@ -154,15 +204,81 @@ class WebRTCClient {
 
     handleRegistered(data) {
         console.log('User registered:', data);
+        this.isRegistered = true;
+        this.registrationRetries = 0;
+
+        if (this.onRegistered) {
+            this.onRegistered(data);
+        }
+    }
+
+    handleRegistrationError(error) {
+        console.error('Registration error:', error);
+        this.isRegistered = false;
+
+        if (this.registrationRetries < this.maxRegistrationRetries) {
+            this.registrationRetries++;
+            console.log(`Retrying registration (attempt ${this.registrationRetries}/${this.maxRegistrationRetries})`);
+            setTimeout(() => {
+                this.registerUser();
+            }, 2000 * this.registrationRetries);
+        } else {
+            console.error('Max registration retries reached');
+            if (this.onRegistrationFailed) {
+                this.onRegistrationFailed(error);
+            }
+        }
+    }
+
+    handleUserReconnected(data) {
+        console.log('User reconnected:', data);
+        if (this.onUserReconnected) {
+            this.onUserReconnected(data);
+        }
+    }
+
+    handleOnlineUsers(users) {
+        console.log('Online users:', users);
+        if (this.onOnlineUsers) {
+            this.onOnlineUsers(users);
+        }
+    }
+
+    handleUserStatusChange(data) {
+        console.log('User status change:', data);
+        if (this.onUserStatusChange) {
+            this.onUserStatusChange(data);
+        }
     }
 
     async initiateCall(calleeId, calleeName) {
         try {
+            // Validate connection and registration state
+            if (!this.isConnected) {
+                throw new Error('Not connected to signaling server');
+            }
+
+            if (!this.isRegistered) {
+                throw new Error('User not registered');
+            }
+
+            if (!calleeId || !calleeName) {
+                throw new Error('Invalid callee information');
+            }
+
+            if (this.currentCallId) {
+                throw new Error('Call already in progress');
+            }
+
             this.isCaller = true;
             this.currentCallId = this.generateCallId();
 
             console.log(`Initiating call to ${calleeName} (${calleeId})`);
 
+            // Get local media stream first
+            await this.getLocalMediaStream();
+
+            // Then initiate the call
             this.socket.emit('initiateCall', {
                 callId: this.currentCallId,
                 callerId: this.userId,
@@ -170,11 +286,11 @@ class WebRTCClient {
                 callerName: this.userName
             });
 
-            // Get local media stream
-            await this.getLocalMediaStream();
-
         } catch (error) {
             console.error('Failed to initiate call:', error);
+            // Clean up on error
+            this.currentCallId = null;
+            this.isCaller = false;
             throw error;
         }
     }
@@ -288,6 +404,11 @@ class WebRTCClient {
         if (this.onCallError) {
             this.onCallError(data);
         }
+
+        // Clean up call state on error
+        this.currentCallId = null;
+        this.isCaller = false;
+        this.cleanup();
     }
 
     createPeerConnection() {
@@ -547,6 +668,33 @@ class WebRTCClient {
             webRTCSupported: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
             rtcPeerConnectionSupported: !!(window.RTCPeerConnection || window.webkitRTCPeerConnection)
         };
+    }
+
+    // Get current connection status
+    getConnectionStatus() {
+        return {
+            isConnected: this.isConnected,
+            isRegistered: this.isRegistered,
+            currentCallId: this.currentCallId,
+            isCaller: this.isCaller,
+            browser: this.browser,
+            socketId: this.socket ? this.socket.id : null,
+            userId: this.userId,
+            userName: this.userName
+        };
+    }
+
+    // Force reconnection
+    forceReconnect() {
+        if (this.socket) {
+            this.socket.disconnect();
+            this.socket.connect();
+        }
+    }
+
+    // Check if ready to make calls
+    isReadyForCalls() {
+        return this.isConnected && this.isRegistered && !this.currentCallId;
     }
 }
 
